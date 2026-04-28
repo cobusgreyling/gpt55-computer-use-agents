@@ -697,9 +697,21 @@ def _execute_browser_action(page, action: dict):
     elif atype == "type":
         page.keyboard.type(action.get("text", "") or "")
     elif atype in ("keypress", "key"):
+        # Playwright key names are case-sensitive; normalise common variants
+        _KEY_MAP = {
+            "ENTER": "Enter", "RETURN": "Enter", "enter": "Enter", "return": "Enter",
+            "TAB": "Tab", "tab": "Tab",
+            "ESCAPE": "Escape", "ESC": "Escape", "escape": "Escape", "esc": "Escape",
+            "BACKSPACE": "Backspace", "backspace": "Backspace",
+            "DELETE": "Delete", "delete": "Delete",
+            "SPACE": " ", "space": " ",
+            "ARROWUP": "ArrowUp", "ARROWDOWN": "ArrowDown",
+            "ARROWLEFT": "ArrowLeft", "ARROWRIGHT": "ArrowRight",
+        }
         keys = action.get("keys", []) or []
         if isinstance(keys, str):
             keys = [keys]
+        keys = [_KEY_MAP.get(k, k) for k in keys]
         if len(keys) == 1:
             page.keyboard.press(keys[0])
         elif len(keys) > 1:
