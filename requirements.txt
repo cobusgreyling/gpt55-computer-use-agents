@@ -1,0 +1,7 @@
+gradio
+pillow
+matplotlib
+
+# Optional — for live CUA mode
+# openai
+# playwright
