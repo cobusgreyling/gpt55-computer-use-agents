@@ -656,8 +656,21 @@ def _take_browser_screenshot(page) -> str:
 def _parse_live_actions(computer_call) -> list[dict]:
     """Parse actions from a live API computer_call response item."""
     actions = []
-    if hasattr(computer_call, "actions"):
-        for act in computer_call.actions:
+    raw_actions = getattr(computer_call, "actions", []) or []
+    for act in raw_actions:
+        # Actions can be dicts or objects depending on SDK version
+        if isinstance(act, dict):
+            actions.append({
+                "type": act.get("type", "unknown"),
+                "x": act.get("x", 0),
+                "y": act.get("y", 0),
+                "text": act.get("text", ""),
+                "keys": act.get("keys", []),
+                "button": act.get("button", "left"),
+                "scroll_x": act.get("scroll_x", 0),
+                "scroll_y": act.get("scroll_y", 0),
+            })
+        else:
             actions.append({
                 "type": getattr(act, "type", "unknown"),
                 "x": getattr(act, "x", 0),
@@ -673,35 +686,40 @@ def _parse_live_actions(computer_call) -> list[dict]:
 
 def _execute_browser_action(page, action: dict):
     """Execute a single CUA action in the Playwright browser."""
-    atype = action["type"]
-    x, y = action.get("x", 0), action.get("y", 0)
+    atype = action.get("type", "")
+    x, y = action.get("x", 0) or 0, action.get("y", 0) or 0
 
     if atype == "click":
-        button = action.get("button", "left")
+        button = action.get("button", "left") or "left"
         page.mouse.click(x, y, button=button)
     elif atype == "double_click":
         page.mouse.dblclick(x, y)
     elif atype == "type":
-        page.keyboard.type(action.get("text", ""))
-    elif atype == "keypress":
-        keys = action.get("keys", [])
+        page.keyboard.type(action.get("text", "") or "")
+    elif atype in ("keypress", "key"):
+        keys = action.get("keys", []) or []
+        if isinstance(keys, str):
+            keys = [keys]
         if len(keys) == 1:
             page.keyboard.press(keys[0])
         elif len(keys) > 1:
-            # Modifier combos like Ctrl+C
             combo = "+".join(keys)
             page.keyboard.press(combo)
     elif atype == "scroll":
-        page.mouse.wheel(action.get("scroll_x", 0), action.get("scroll_y", 0))
+        page.mouse.wheel(
+            action.get("scroll_x", 0) or 0,
+            action.get("scroll_y", 0) or 0,
+        )
     elif atype == "move":
         page.mouse.move(x, y)
     elif atype == "drag":
         page.mouse.move(x, y)
         page.mouse.down()
-        # If there's an end position, move there
         page.mouse.up()
     elif atype == "wait":
         time.sleep(0.5)
+    elif atype == "screenshot":
+        pass  # Model requests a fresh screenshot — handled by the loop
 
     # Small delay between actions for stability
     time.sleep(0.3)
@@ -709,24 +727,29 @@ def _execute_browser_action(page, action: dict):
 
 def _format_live_action(action: dict) -> str:
     """Format a live action dict for display."""
-    atype = action["type"]
+    atype = action.get("type", "unknown")
     if atype == "click":
-        return f"click({action['x']}, {action['y']}) [{action.get('button', 'left')}]"
+        return f"click({action.get('x', 0)}, {action.get('y', 0)}) [{action.get('button', 'left')}]"
     elif atype == "double_click":
-        return f"double_click({action['x']}, {action['y']})"
+        return f"double_click({action.get('x', 0)}, {action.get('y', 0)})"
     elif atype == "type":
-        text = action.get("text", "")
+        text = action.get("text", "") or ""
         display = text[:60] + "..." if len(text) > 60 else text
         return f'type("{display}")'
-    elif atype == "keypress":
-        return f"keypress({'+'.join(action.get('keys', []))})"
+    elif atype in ("keypress", "key"):
+        keys = action.get("keys", []) or []
+        if isinstance(keys, str):
+            keys = [keys]
+        return f"keypress({'+'.join(keys)})"
     elif atype == "scroll":
         return f"scroll(dx={action.get('scroll_x', 0)}, dy={action.get('scroll_y', 0)})"
     elif atype == "move":
-        return f"move({action['x']}, {action['y']})"
+        return f"move({action.get('x', 0)}, {action.get('y', 0)})"
     elif atype == "wait":
         return "wait()"
-    return atype
+    elif atype == "screenshot":
+        return "screenshot()"
+    return f"{atype}({action})"
 
 
 def run_live_cua(
@@ -767,18 +790,27 @@ def run_live_cua(
         lines.append(f"Blocked URLs: {', '.join(blocked)}")
     lines.append("=" * 70)
 
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=True,
-        args=["--disable-extensions", "--disable-file-system"],
-    )
-    context = browser.new_context(viewport={"width": 1280, "height": 720})
-    page = context.new_page()
+    pw = None
+    browser = None
+    context = None
+    page = None
 
     try:
+        lines.append("\nLaunching browser...")
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--disable-extensions", "--disable-file-system", "--no-sandbox"],
+        )
+        context = browser.new_context(viewport={"width": 1280, "height": 720})
+        page = context.new_page()
+        page.set_default_timeout(15000)
+
         # Navigate to start URL
+        lines.append(f"Navigating to {start_url}...")
         page.goto(start_url, wait_until="domcontentloaded", timeout=15000)
         time.sleep(1)
+        lines.append("Browser ready.")
 
         # Take initial screenshot
         screenshot_b64 = _take_browser_screenshot(page)
@@ -806,6 +838,26 @@ def run_live_cua(
 
         lines.append(f"  Latency: {latency}ms")
 
+        # Debug: log response structure
+        lines.append(f"  Response ID: {getattr(response, 'id', 'N/A')}")
+        lines.append(f"  Output items: {len(response.output)}")
+        for dbg_item in response.output:
+            item_type = getattr(dbg_item, "type", "unknown")
+            lines.append(f"    - type: {item_type}")
+            if item_type == "computer_call":
+                lines.append(f"      call_id: {getattr(dbg_item, 'call_id', 'N/A')}")
+                dbg_actions = getattr(dbg_item, "actions", [])
+                lines.append(f"      actions: {len(dbg_actions)}")
+            elif hasattr(dbg_item, "content") and dbg_item.content:
+                for blk in dbg_item.content:
+                    blk_type = getattr(blk, "type", "?")
+                    blk_text = getattr(blk, "text", "")[:150]
+                    lines.append(f"      content: [{blk_type}] {blk_text}")
+            else:
+                # Dump all attributes for debugging
+                attrs = {k: str(v)[:100] for k, v in vars(dbg_item).items() if not k.startswith("_")}
+                lines.append(f"      attrs: {attrs}")
+
         # CUA loop
         for step in range(2, max_steps + 1):
             # Find computer_call in response output
@@ -815,12 +867,18 @@ def run_live_cua(
             ]
             if not computer_calls:
                 lines.append(f"\n--- Loop complete: no computer_call returned ---")
-                # Collect any text output
+                # Collect any text output from all item types
                 for item in response.output:
-                    if getattr(item, "type", "") == "message":
-                        for block in getattr(item, "content", []):
-                            if getattr(block, "type", "") == "text":
-                                lines.append(f"  Model says: {block.text[:300]}")
+                    item_type = getattr(item, "type", "")
+                    # Handle direct text items
+                    if item_type == "output_text":
+                        lines.append(f"  Model says: {getattr(item, 'text', '')[:500]}")
+                    # Handle message-wrapped content
+                    elif hasattr(item, "content") and item.content:
+                        for block in item.content:
+                            block_type = getattr(block, "type", "")
+                            if block_type in ("output_text", "text"):
+                                lines.append(f"  Model says: {getattr(block, 'text', '')[:500]}")
                 break
 
             call = computer_calls[0]
@@ -869,15 +927,33 @@ def run_live_cua(
                 total_output += getattr(response.usage, "output_tokens", 0)
 
             lines.append(f"  Latency: {latency}ms")
+
+            # Debug: log each step's response
+            for dbg_item in response.output:
+                item_type = getattr(dbg_item, "type", "unknown")
+                if item_type == "computer_call":
+                    dbg_actions = getattr(dbg_item, "actions", [])
+                    for da in dbg_actions:
+                        lines.append(f"    -> {getattr(da, 'type', '?')} "
+                                     f"x={getattr(da, 'x', '')} y={getattr(da, 'y', '')} "
+                                     f"text={getattr(da, 'text', '')[:60]}")
         else:
             lines.append(f"\n--- Max steps ({max_steps}) reached ---")
 
     except Exception as e:
+        import traceback
         lines.append(f"\nERROR: {type(e).__name__}: {e}")
+        lines.append(traceback.format_exc())
     finally:
-        context.close()
-        browser.close()
-        pw.stop()
+        try:
+            if context:
+                context.close()
+            if browser:
+                browser.close()
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
 
     # Summary
     total_cost = (total_input / 1_000_000) * 5.0 + (total_output / 1_000_000) * 30.0
